@@ -672,7 +672,24 @@ function tripLegs(trip, battery) {
         });
       }
     }
-    if (l.kind === 'dest' && trip.round) back = true;   // everything after the destination is the drive back
+    if (l.kind === 'dest' && trip.round) {
+      back = true;   // everything after the destination is the drive back
+      if (has(l.odo2) && num(l.odo2) >= num(l.odo)) {
+        // Driving around at the destination is its own leg, kept out of the drive back.
+        // If the car was charged there, the readings can't show what that driving used.
+        var charged = has(l.kwh) || num(l.pct2) > num(l.pct) || num(l.est2) > num(l.est);
+        var localUsed = (!charged && has(l.pct) && has(l.pct2)) ? num(l.pct) - num(l.pct2) : 0;
+        var localPromised = (!charged && has(l.est) && has(l.est2)) ? num(l.est) - num(l.est2) : 0;
+        legs.push({
+          from: i, to: i, local: true, back: false, miles: num(l.odo2) - num(l.odo),
+          promised: localPromised > 0 ? localPromised : 0,
+          kwh: localUsed > 0 ? localUsed / 100 * battery : 0
+        });
+        prev = { kind: 'dest', odo: l.odo2, pct: l.pct, est: l.est, pct2: l.pct2, est2: l.est2 };
+        prevIdx = i;
+        return;
+      }
+    }
     prev = l; prevIdx = i;
   });
   return legs;
@@ -684,6 +701,7 @@ function tripStats(trips, battery, part) {
   var t = { trips: trips.length, miles: 0, energyMiles: 0, kwh: 0, promised: 0, promisedMiles: 0 };
   trips.forEach(function (trip) {
     tripLegs(trip, battery).forEach(function (l) {
+      if (part && l.local) return;
       if (part === 'out' && l.back) return;
       if (part === 'back' && !l.back) return;
       t.miles += l.miles;
@@ -850,12 +868,15 @@ function planTrip(miles, startPct, miPerKwh, battery) {
       return '<div class="line">' +
         '<div class="line-head"><strong>' + labels[i] + '</strong>' +
           (stop ? '<button type="button" class="link danger" data-remove="' + i + '">Remove</button>' : '') + '</div>' +
+        (stop ? '<div class="sub">Arrival</div>' : '') +
         '<div class="grid3">' + cell(i, 'odo', 'Odometer', l.odo) + cell(i, 'pct', 'Battery %', l.pct) + cell(i, 'est', 'Miles left', l.est) + '</div>' +
-        (stop ? '<div class="sub">' + (dest ? 'When leaving (leave blank if you did not charge)' : 'After charging') + '</div>' +
-          '<div class="grid3">' + cell(i, 'pct2', 'Battery %', l.pct2) + cell(i, 'est2', 'Miles left', l.est2) + '</div>' +
-          '<div class="sub">Charging session (can be filled in later)</div>' +
-          '<div class="grid3 two">' + cell(i, 'kwh', 'kWh added', l.kwh, 'optional') + cell(i, 'cost', 'Cost ($)', l.cost, 'optional') + '</div>' : '') +
+        (stop ? '<div class="sub">' + (dest ? 'Charging while there (if any, can be filled in later)' : 'Charging session (can be filled in later)') + '</div>' +
+          '<div class="grid3 two">' + cell(i, 'kwh', 'kWh added', l.kwh, 'optional') + cell(i, 'cost', 'Cost ($)', l.cost, 'optional') + '</div>' +
+          '<div class="sub">' + (dest ? 'Departure, heading back' : 'Departure, after charging') + '</div>' +
+          '<div class="grid3' + (dest ? '' : ' two') + '">' + (dest ? cell(i, 'odo2', 'Odometer', l.odo2) : '') +
+            cell(i, 'pct2', 'Battery %', l.pct2) + cell(i, 'est2', 'Miles left', l.est2) + '</div>' : '') +
         (i > 0 ? '<div class="leg" id="leg-' + i + '"></div>' : '') +
+        (dest ? '<div class="leg" id="local-' + i + '"></div>' : '') +
       '</div>';
     }).join('');
     setSeg('t-type', TYPE_NAMES[t.type] ? t.type : 'highway');
@@ -884,8 +905,13 @@ function planTrip(miles, startPct, miPerKwh, battery) {
     t.lines.forEach(function (l, i) {
       var el = $('leg-' + i);
       if (!el) return;
-      var leg = legs.filter(function (x) { return x.to === i; })[0];
+      var leg = legs.filter(function (x) { return x.to === i && !x.local; })[0];
       el.textContent = leg ? legText(leg) : '';
+      var localEl = $('local-' + i);
+      if (localEl) {
+        var local = legs.filter(function (x) { return x.to === i && x.local; })[0];
+        localEl.textContent = local ? 'Around the destination: ' + legText(local) : '';
+      }
     });
   }
 
@@ -1000,7 +1026,7 @@ function planTrip(miles, startPct, miPerKwh, battery) {
   function showError(id, msg) { var el = $(id); el.textContent = msg; el.hidden = !msg; }
   function newLine(kind) {
     return kind === 'charge' || kind === 'dest'
-      ? { kind: kind, odo: '', pct: '', est: '', pct2: '', est2: '', kwh: '', cost: '' }
+      ? { kind: kind, odo: '', pct: '', est: '', odo2: '', pct2: '', est2: '', kwh: '', cost: '' }
       : { kind: kind, odo: '', pct: '', est: '' };
   }
   function addStop(kind) {
@@ -1058,8 +1084,12 @@ function planTrip(miles, startPct, miPerKwh, battery) {
       if (!has(lines[i].odo)) {
         return showError('sheet-error', 'Enter the odometer for "' + labels[i] + '"' + (isStop(lines[i]) ? ', or remove that line.' : '.'));
       }
-      if (i > 0 && num(lines[i].odo) < num(lines[i - 1].odo)) {
+      var before = i > 0 ? lines[i - 1] : null;
+      if (before && num(lines[i].odo) < (has(before.odo2) ? num(before.odo2) : num(before.odo))) {
         return showError('sheet-error', 'The odometer for "' + labels[i] + '" is lower than the line before it.');
+      }
+      if (has(lines[i].odo2) && num(lines[i].odo2) < num(lines[i].odo)) {
+        return showError('sheet-error', 'On "' + labels[i] + '" the leaving odometer is lower than the arrival odometer.');
       }
     }
     if (!has(first.est) && !has(first.pct)) {
@@ -1129,12 +1159,14 @@ function planTrip(miles, startPct, miPerKwh, battery) {
       var labels = lineLabels(trip);
       tripLegs(trip, battery).forEach(function (l) {
         rows.push([shortDate(trip.started), n + 1, trip.round ? 'yes' : 'no', TYPE_NAMES[trip.type] || 'Mixed',
-                   trip.temp, trip.note, labels[l.from], labels[l.to], trip.round ? (l.back ? 'Back' : 'Out') : '',
-                   trip.lines[l.from].odo, trip.lines[l.to].odo, l.miles,
+                   trip.temp, trip.note, labels[l.from], l.local ? 'Around destination' : labels[l.to],
+                   l.local ? 'Local' : (trip.round ? (l.back ? 'Back' : 'Out') : ''),
+                   l.local ? trip.lines[l.from].odo : (has(trip.lines[l.from].odo2) ? trip.lines[l.from].odo2 : trip.lines[l.from].odo),
+                   l.local ? trip.lines[l.to].odo2 : trip.lines[l.to].odo, l.miles,
                    l.promised > 0 ? l.promised.toFixed(1) : '',
                    l.promised > 0 ? accuracyText(l.miles / l.promised) : '',
                    l.kwh > 0 ? l.kwh.toFixed(2) : '', l.kwh > 0 ? (l.miles / l.kwh).toFixed(2) : '',
-                   trip.lines[l.to].kwh || '', trip.lines[l.to].cost || '']);
+                   l.local ? '' : (trip.lines[l.to].kwh || ''), l.local ? '' : (trip.lines[l.to].cost || '')]);
       });
     });
     return rows.map(function (r) { return r.map(csvCell).join(','); }).join('\n');
